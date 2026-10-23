@@ -436,13 +436,12 @@ class LiteLLMAiohttpTransport(AiohttpTransport):
                 # Read _owns_session before _rebuild_session() claims ownership.
                 if self._owns_session and isinstance(client_session, ClientSession):
                     self._close_recycled_session(client_session)
-                self.client = self._rebuild_session()
-                client_session = self.client
+                retry_client_session: Final = self._get_valid_client_session()
 
                 # Retry the request with the new session
                 with map_aiohttp_exceptions():
                     response = await self._make_aiohttp_request(
-                        client_session=client_session,
+                        client_session=retry_client_session,
                         request=request,
                         timeout=timeout,
                         proxy=proxy,

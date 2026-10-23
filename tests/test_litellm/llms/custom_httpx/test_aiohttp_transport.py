@@ -1,8 +1,9 @@
 import asyncio
 import concurrent.futures
 import socket
+import ssl
 import sys
-from typing import Final
+from typing import Final, cast
 
 import aiohttp
 import aiohttp.abc
@@ -10,11 +11,12 @@ import aiohttp.client_exceptions
 import aiohttp.http_exceptions
 import httpx
 import pytest
-
+from aiohttp.client import ClientResponse, ClientSession
 
 from litellm.llms.custom_httpx.aiohttp_transport import (
     AiohttpResponseStream,
     AiohttpTransport,
+    HttpxTimeoutExtension,
     LiteLLMAiohttpTransport,
 )
 
@@ -1065,7 +1067,7 @@ def test_threadsafe_close_done_callback_tolerates_cancelled_future():
 
 
 @pytest.mark.asyncio
-async def test_session_closed_retry_does_not_close_concurrent_replacement():
+async def test_session_closed_retry_does_not_close_concurrent_replacement() -> None:
     """
     Regression test for #24230 (review finding): when the "Session is closed"
     retry fires, the handler must dispose the session that actually faulted,
@@ -1074,27 +1076,39 @@ async def test_session_closed_retry_does_not_close_concurrent_replacement():
     """
     from unittest.mock import patch
 
-    faulted_session = aiohttp.ClientSession()
-    healthy_replacement = aiohttp.ClientSession()
-    transport = LiteLLMAiohttpTransport(client=lambda: aiohttp.ClientSession())
+    faulted_session: Final = aiohttp.ClientSession()
+    healthy_replacement: Final = aiohttp.ClientSession()
+    transport: Final = LiteLLMAiohttpTransport(client=lambda: aiohttp.ClientSession())
     transport.client = faulted_session
 
-    calls = {"n": 0}
+    calls: Final[list[None]] = []
 
-    async def fake_make_request(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
+    async def fake_make_request(
+        client_session: ClientSession,
+        request: httpx.Request,
+        timeout: HttpxTimeoutExtension,
+        proxy: str | None,
+        sni_hostname: str | None,
+        ssl_verify: bool | ssl.SSLContext | None = None,
+    ) -> ClientResponse:
+        calls.append(None)
+        if len(calls) == 1:
             # simulate a concurrent task replacing the shared session between
             # the failed await and the exception handler
             transport.client = healthy_replacement
             raise RuntimeError("Session is closed")
-        raise StopAsyncIteration("stop after retry dispatch")
+        if len(calls) == 2:
+            raise RuntimeError("Session is closed")
+        raise StopAsyncIteration("unexpected third attempt")
 
-    with patch.object(transport, "_make_aiohttp_request", side_effect=fake_make_request):
-        with pytest.raises(StopAsyncIteration):
-            await transport.handle_async_request(httpx.Request("GET", "http://example.com"))
+    with (
+        patch.object(transport, "_make_aiohttp_request", side_effect=fake_make_request),
+        pytest.raises(RuntimeError, match="Session is closed"),
+    ):
+        await transport.handle_async_request(httpx.Request("GET", "http://example.com"))
 
     try:
+        assert len(calls) == 2
         assert not healthy_replacement.closed, "concurrent replacement session must not be closed by the retry handler"
         for _ in range(3):
             await asyncio.sleep(0)
@@ -1102,9 +1116,116 @@ async def test_session_closed_retry_does_not_close_concurrent_replacement():
     finally:
         await faulted_session.close()
         await healthy_replacement.close()
-        new_session = transport.client
+        new_session: Final = transport.client
         if isinstance(new_session, aiohttp.ClientSession):
             await new_session.close()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_runtime_error_does_not_retry() -> None:
+    from unittest.mock import patch
+
+    session: Final = aiohttp.ClientSession()
+    transport: Final = LiteLLMAiohttpTransport(client=session)
+    calls: Final[list[None]] = []
+
+    async def fail_request(
+        client_session: ClientSession,
+        request: httpx.Request,
+        timeout: HttpxTimeoutExtension,
+        proxy: str | None,
+        sni_hostname: str | None,
+        ssl_verify: bool | ssl.SSLContext | None = None,
+    ) -> ClientResponse:
+        calls.append(None)
+        raise RuntimeError("unrelated wire failure")
+
+    try:
+        with (
+            patch.object(transport, "_make_aiohttp_request", side_effect=fail_request),
+            pytest.raises(RuntimeError, match="unrelated wire failure"),
+        ):
+            await transport.handle_async_request(httpx.Request("GET", "http://example.invalid/"))
+        assert len(calls) == 1
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.parametrize("request_count", [1, 2])
+@pytest.mark.asyncio
+async def test_session_closed_retries_share_one_replacement(request_count: int) -> None:
+    original_session: Final = aiohttp.ClientSession()
+    created_sessions: Final[list[ClientSession]] = [original_session]
+    original_attempts: Final[list[ClientSession]] = []
+    retry_sessions: Final[list[ClientSession]] = []
+    original_attempts_ready: Final = asyncio.Event()
+    responses: Final[list[httpx.Response]] = []
+
+    def session_factory() -> ClientSession:
+        session: Final = aiohttp.ClientSession()
+        created_sessions.append(session)
+        return session
+
+    class BarrierTransport(LiteLLMAiohttpTransport):
+        async def _make_aiohttp_request(
+            self,
+            client_session: ClientSession,
+            request: httpx.Request,
+            timeout: HttpxTimeoutExtension,
+            proxy: str | None,
+            sni_hostname: str | None,
+            ssl_verify: bool | ssl.SSLContext | None = None,
+        ) -> ClientResponse:
+            if client_session is not original_session:
+                retry_sessions.append(client_session)
+                return cast(ClientResponse, MockAiohttpResponse())
+
+            original_attempts.append(client_session)
+            if len(original_attempts) == request_count:
+                await original_session.close()
+                original_attempts_ready.set()
+            await asyncio.wait_for(original_attempts_ready.wait(), timeout=1)
+            return await super()._make_aiohttp_request(
+                client_session,
+                request,
+                timeout,
+                proxy,
+                sni_hostname,
+                ssl_verify,
+            )
+
+    transport: Final = BarrierTransport(
+        client=original_session,
+        session_factory=session_factory,
+    )
+    tasks: Final = tuple(
+        asyncio.create_task(transport.handle_async_request(httpx.Request("GET", "http://example.invalid/")))
+        for _ in range(request_count)
+    )
+
+    try:
+        responses.extend(await asyncio.wait_for(asyncio.gather(*tasks), timeout=3))
+        replacement: Final = created_sessions[1]
+        response_bodies: Final = await asyncio.wait_for(
+            asyncio.gather(*(response.aread() for response in responses)), timeout=1
+        )
+
+        assert tuple(response_bodies) == (b"chunk1chunk2chunk3",) * request_count
+        assert len(created_sessions) == 2
+        assert retry_sessions == [replacement] * request_count
+        assert not replacement.closed
+
+        await transport.aclose()
+        assert replacement.closed
+        assert all(session.closed for session in created_sessions)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(response.aclose() for response in responses), return_exceptions=True)
+        await transport.aclose()
+        await asyncio.gather(*(session.close() for session in created_sessions), return_exceptions=True)
 
 
 @pytest.mark.asyncio
