@@ -1,3 +1,5 @@
+> **DoctorinaAI maintenance fork** of [BerriAI/litellm](https://github.com/BerriAI/litellm). See [DOCTORINA_PATCHES.md](DOCTORINA_PATCHES.md) for the patch record, upgrade process, and release steps.
+
 <h1 align="center">
         🚅 LiteLLM
     </h1>
