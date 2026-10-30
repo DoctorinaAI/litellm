@@ -10,6 +10,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 
+from openai.types.file_deleted import FileDeleted
 from packaging.version import Version
 
 import litellm
@@ -343,6 +344,7 @@ class LangFuseLogger:
         | TranscriptionResponse
         | RerankResponse
         | HttpxBinaryResponseContent
+        | FileDeleted
         | ResponsesAPIResponse,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
@@ -428,6 +430,7 @@ class LangFuseLogger:
         | TranscriptionResponse
         | RerankResponse
         | HttpxBinaryResponseContent
+        | FileDeleted
         | ResponsesAPIResponse,
         prompt: dict,
         level: str,
@@ -736,7 +739,9 @@ class LangFuseLogger:
             usage = None
             usage_details = None
             if response_obj is not None:
-                if hasattr(response_obj, "id") and response_obj.get("id", None) is not None:
+                if isinstance(response_obj, FileDeleted):
+                    generation_id = _logging_id(start_time, {"id": response_obj.id})
+                elif hasattr(response_obj, "id") and response_obj.get("id", None) is not None:
                     generation_id = _logging_id(start_time, response_obj)
                 _usage_obj: Final[_UsageObject | None] = getattr(response_obj, "usage", None)
 

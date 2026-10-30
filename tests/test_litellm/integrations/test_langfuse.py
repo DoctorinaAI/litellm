@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import sys
 import types
 import unittest
@@ -7,6 +8,7 @@ from typing import Final, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+from openai.types.file_deleted import FileDeleted
 
 import litellm
 from litellm.integrations.langfuse import langfuse as langfuse_module
@@ -1307,6 +1309,43 @@ def _steering_logger() -> LangFuseLogger:
     logger.Langfuse = MagicMock()
     logger.langfuse_sdk_version = "2.60.0"
     return logger
+
+
+@pytest.mark.parametrize("metadata_generation_id", [None, "metadata-generation-id"])
+def test_log_event_on_langfuse_logs_file_deleted(
+    metadata_generation_id: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger: Final = LangFuseLogger.__new__(LangFuseLogger)
+    logger.Langfuse = MagicMock()
+    logger.langfuse_sdk_version = "2.60.0"
+    logger.Langfuse.trace.return_value.generation.return_value.trace_id = "file-delete-call"
+    response_obj: Final = FileDeleted(id="file-delete-id", deleted=True, object="file")
+    response_before: Final = response_obj.model_dump()
+    start_time: Final = datetime.datetime(2024, 1, 2, 3, 4, 5, 678901, tzinfo=datetime.timezone.utc)
+    metadata: Final = {} if metadata_generation_id is None else {"generation_id": metadata_generation_id}
+
+    with caplog.at_level(logging.ERROR, logger="LiteLLM"):
+        result: Final = logger.log_event_on_langfuse(
+            kwargs={
+                "call_type": "afile_delete",
+                "litellm_call_id": "file-delete-call",
+                "litellm_params": {"metadata": metadata},
+            },
+            response_obj=response_obj,
+            start_time=start_time,
+            end_time=start_time,
+        )
+
+    default_generation_id: Final = "time-03-04-05-678901_file-delete-id"
+    expected_generation_id: Final = default_generation_id if metadata_generation_id is None else metadata_generation_id
+    generation_call: Final = logger.Langfuse.trace.return_value.generation
+    assert result == {"trace_id": "file-delete-call", "generation_id": default_generation_id}
+    assert logger.Langfuse.trace.call_args.kwargs["id"] == "file-delete-call"
+    assert generation_call.call_count == 1
+    assert generation_call.call_args.kwargs["id"] == expected_generation_id
+    assert not any(record.name == "LiteLLM" and record.levelno >= logging.ERROR for record in caplog.records)
+    assert response_obj.model_dump() == response_before
 
 
 def _emit(logger: LangFuseLogger, *, metadata=None, headers=None):

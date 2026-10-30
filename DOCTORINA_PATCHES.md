@@ -69,9 +69,32 @@ maturin sdist
 
 For each wheel, verify it contains the reviewed aiohttp transport and that the native module imports. Install a supported wheel in a clean environment with `uv pip install --no-build <wheel>`, replacing `<wheel>` with that platform's wheel path. Run the mapped transport module against installed artifacts where supported; do not use the one-off Linux probes as a rerun command or treat a source-checkout test as proof of wheel contents
 
+## Langfuse FileDeleted callback
+
+| Field | Value |
+| --- | --- |
+| Release target | `v1.103.4-session-recovery.2` |
+| Python package version | `1.103.4` |
+| Patch set | Aiohttp session recovery above and this callback patch |
+| Source file | `litellm/integrations/langfuse/langfuse.py` |
+| Test file | `tests/test_litellm/integrations/test_langfuse.py` |
+
+The Langfuse callback now handles the real OpenAI SDK `FileDeleted` response by reading its `id` attribute and passing `{"id": ...}` to the existing timestamped logging ID helper. The regression checks trace and generation linkage, the timestamped returned ID, a metadata override of the sink ID, an unchanged SDK response, and no callback error log
+
+The focused regression constructs the real SDK response and covers both metadata cases. From the repository root, rerun it and the combined callback and transport suite with:
+
+```bash
+uv run --frozen --no-sync pytest tests/test_litellm/integrations/test_langfuse.py::test_log_event_on_langfuse_logs_file_deleted -q
+uv run --frozen --no-sync pytest tests/test_litellm/integrations/test_langfuse.py tests/test_litellm/llms/custom_httpx/test_aiohttp_transport.py -q --tb=short
+```
+
+Recorded verification: the focused regression passed 2 cases, and the combined suite passed 156 tests. A Langfuse generation records callback telemetry; it does not prove provider-side deletion or the provider's deletion outcome
+
+Release target `.2` groups both patches at package version `1.103.4`. Keep the published `.1` wheels, sdist, and checksum index unchanged
+
 ## Updating the consumer project
 
-From the consumer project's `backend/` directory, point the index named `litellm-session-recovery` in its uv configuration to `https://github.com/DoctorinaAI/litellm/releases/download/v1.103.4-session-recovery.1/index.html`. Regenerate the lock without `--frozen`:
+From the consumer project's `backend/` directory, point the index named `litellm-session-recovery` in its uv configuration to `https://github.com/DoctorinaAI/litellm/releases/download/v1.103.4-session-recovery.2/index.html`. Regenerate the lock without `--frozen`:
 
 ```bash
 uv lock
